@@ -10,6 +10,7 @@ import logging
 from tqdm import tqdm
 
 from src.models import GNN 
+from src.loss import SymmetricCrossEntropyLoss
 
 # Set the random seed
 set_seed()
@@ -75,7 +76,6 @@ def save_predictions(predictions, test_path):
     output_df.to_csv(output_csv_path, index=False)
     print(f"Predictions saved to {output_csv_path}")
 
-
 def plot_training_progress(train_losses, train_accuracies, output_dir):
     epochs = range(1, len(train_losses) + 1)
     plt.figure(figsize=(12, 6))
@@ -94,20 +94,17 @@ def plot_training_progress(train_losses, train_accuracies, output_dir):
     plt.ylabel('Accuracy')
     plt.title('Training Accuracy per Epoch')
 
-    # Save plots in the current directory
     os.makedirs(output_dir, exist_ok=True)
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "training_progress.png"))
     plt.close()
 
 def main(args):
-    # Get the directory where the main script is located
     script_dir = os.path.dirname(os.path.abspath(__file__))
     device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
-    num_checkpoints = args.num_checkpoints if args.num_checkpoints else 3
-    
-    
+    num_checkpoints = args.num_checkpoints if args.num_checkpoints else 5
 
+    # Model
     if args.gnn == 'gin':
         model = GNN(gnn_type = 'gin', num_class = 6, num_layer = args.num_layer, emb_dim = args.emb_dim, drop_ratio = args.drop_ratio, virtual_node = False).to(device)
     elif args.gnn == 'gin-virtual':
@@ -119,51 +116,57 @@ def main(args):
     else:
         raise ValueError('Invalid GNN type')
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = SymmetricCrossEntropyLoss()
 
-    # Identify dataset folder (A, B, C, or D)
+    # Dataset name and logging
     test_dir_name = os.path.basename(os.path.dirname(args.test_path))
-    
-    # Setup logging
     logs_folder = os.path.join(script_dir, "logs", test_dir_name)
     log_file = os.path.join(logs_folder, "training.log")
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(message)s')
-    logging.getLogger().addHandler(logging.StreamHandler())  # Console output as well
+    logging.getLogger().addHandler(logging.StreamHandler())
 
-
-    # Define checkpoint path relative to the script's directory
+    # Checkpoint path (default)
     checkpoint_path = os.path.join(script_dir, "checkpoints", f"model_{test_dir_name}_best.pth")
     checkpoints_folder = os.path.join(script_dir, "checkpoints", test_dir_name)
     os.makedirs(checkpoints_folder, exist_ok=True)
 
-    # Load pre-trained model for inference
-    if os.path.exists(checkpoint_path) and not args.train_path:
-        model.load_state_dict(torch.load(checkpoint_path))
+    # 加载checkpoint（优先使用参数）
+    if args.checkpoint is not None and os.path.exists(args.checkpoint):
+        model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        print(f"Loaded checkpoint from {args.checkpoint}")
+        checkpoint_path = args.checkpoint
+    elif os.path.exists(checkpoint_path) and not args.train_path:
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         print(f"Loaded best model from {checkpoint_path}")
 
-    # Prepare test dataset and loader
+    # Test data
     test_dataset = GraphDataset(args.test_path, transform=add_zeros)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=8)
 
-    # If train_path is provided, train the model
+    # Training if train_path exists
     if args.train_path:
         train_dataset = GraphDataset(args.train_path, transform=add_zeros)
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8)
 
-        # Training loop
         num_epochs = args.epochs
         best_accuracy = 0.0
         train_losses = []
         train_accuracies = []
 
-        # Calculate intervals for saving checkpoints
+        # 若有checkpoint参数，resume
+        start_epoch = 0
+        if args.checkpoint is not None and os.path.exists(args.checkpoint):
+            print(f"Resuming training from checkpoint: {args.checkpoint}")
+            model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+            # 若保存了optimizer等，可继续加载（此处略）
+
         if num_checkpoints > 1:
             checkpoint_intervals = [int((i + 1) * num_epochs / num_checkpoints) for i in range(num_checkpoints)]
         else:
             checkpoint_intervals = [num_epochs]
 
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             train_loss = train(
                 train_loader, model, optimizer, criterion, device,
                 save_checkpoints=(epoch + 1 in checkpoint_intervals),
@@ -172,23 +175,19 @@ def main(args):
             )
             train_acc, _ = evaluate(train_loader, model, device, calculate_accuracy=True)
             print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
-            
-            # Save logs for training progress
             train_losses.append(train_loss)
             train_accuracies.append(train_acc)
             logging.info(f"Epoch {epoch + 1}/{num_epochs}, Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
 
-            # Save best model
             if train_acc > best_accuracy:
                 best_accuracy = train_acc
                 torch.save(model.state_dict(), checkpoint_path)
                 print(f"Best model updated and saved at {checkpoint_path}")
 
-        # Plot training progress in current directory
         plot_training_progress(train_losses, train_accuracies, os.path.join(logs_folder, "plots"))
 
-    # Generate predictions for the test set using the best model
-    model.load_state_dict(torch.load(checkpoint_path))
+    # 用最佳模型做预测
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     predictions = evaluate(test_loader, model, device, calculate_accuracy=False)
     save_predictions(predictions, args.test_path)
 
@@ -197,13 +196,14 @@ if __name__ == "__main__":
     parser.add_argument("--train_path", type=str, help="Path to the training dataset (optional).")
     parser.add_argument("--test_path", type=str, required=True, help="Path to the test dataset.")
     parser.add_argument("--num_checkpoints", type=int, help="Number of checkpoints to save during training.")
-    parser.add_argument('--device', type=int, default=1, help='which gpu to use if any (default: 0)')
+    parser.add_argument('--device', type=int, default=0, help='which gpu to use if any (default: 0)')
     parser.add_argument('--gnn', type=str, default='gin', help='GNN gin, gin-virtual, or gcn, or gcn-virtual (default: gin-virtual)')
     parser.add_argument('--drop_ratio', type=float, default=0.5, help='dropout ratio (default: 0.5)')
     parser.add_argument('--num_layer', type=int, default=5, help='number of GNN message passing layers (default: 5)')
     parser.add_argument('--emb_dim', type=int, default=300, help='dimensionality of hidden units in GNNs (default: 300)')
     parser.add_argument('--batch_size', type=int, default=32, help='input batch size for training (default: 32)')
-    parser.add_argument('--epochs', type=int, default=10, help='number of epochs to train (default: 10)')
-    
+    parser.add_argument('--epochs', type=int, default=500, help='number of epochs to train (default: 10)')
+    parser.add_argument('--checkpoint', type=str, default=None, help='Path to checkpoint for resume or test (optional).')
+
     args = parser.parse_args()
     main(args)
